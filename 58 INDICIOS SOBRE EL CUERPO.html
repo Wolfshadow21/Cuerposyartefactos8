@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Partículas Etéreas</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            overflow: hidden;
+            background-color: #000; /* Fondo negro puro */
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            touch-action: none;
+        }
+
+        #canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            cursor: none;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            body::before {
+                content: "⚠️ Movimiento reducido activo";
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: rgba(0, 0, 0, 0.8);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 10px;
+                padding: 10px;
+                color: white;
+                font-size: 10px;
+                z-index: 100;
+                opacity: 0.7;
+            }
+        }
+    </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<script>
+/**
+ * Sistema de Partículas Etéreas
+ * Canvas interactivo con partículas que siguen el cursor
+ * Cambios solicitados:
+ * 1) Fondo negro puro
+ * 2) Click = partículas regadas por todo el lienzo (SIN destello)
+ */
+
+class EtherealParticleSystem {
+    constructor(canvas) {
+        // Canvas y contexto
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+
+        // Configuración del sistema
+        this.config = {
+            maxParticles: this.isTouchDevice ? 200 : 800, // Mucho menos en móvil
+            mouseSpawnCount: { min: this.isTouchDevice ? 1 : 3, max: this.isTouchDevice ? 2 : 8 }, // Estela mínima en móvil
+            mouseSpawnRadius: this.isTouchDevice ? 20 : 40, // Radio menor en móvil
+            ambientSpawnRate: this.isTouchDevice ? 0.3 : 1.5, // Muy poco spawn ambiente en móvil
+            particleLife: { min: 1200, max: 2800 }, // ms
+            particleSize: { min: 1.5, max: 3.5 },
+            particleSpeed: { min: -0.3, max: 0.3 },
+            fadeInPercent: 15,
+            fadeOutPercent: 35,
+            inactivityThreshold: 5000, // 5 segundos
+            scatterOnClick: { min: this.isTouchDevice ? 40 : 180, max: this.isTouchDevice ? 80 : 300 }, // Explosión más pequeña en móvil
+            touchHoldTime: 300, // ms para detectar tap vs hold
+            colors: {
+                hMin: 210, hMax: 280, // Azul-Violeta por defecto
+                sMin: 60, sMax: 80,
+                lMin: 60, lMax: 80
+            }
+        };
+
+        // Estado del sistema
+        this.particles = [];
+        this.mouse = { x: 0, y: 0, active: false, pressed: false };
+        this.lastInteraction = Date.now();
+        this.ambientTimer = 0;
+        this.devicePixelRatio = window.devicePixelRatio || 1;
+        this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+        
+        // Estado específico para touch
+        this.touchStartTime = 0;
+        this.touchMoved = false;
+
+        // Inicializar
+        this.setupCanvas();
+        this.setupEventListeners();
+        this.animate();
+    }
+
+    /**
+     * Configurar canvas responsive y retina-ready
+     */
+    setupCanvas() {
+        const rect = this.canvas.getBoundingClientRect();
+
+        // Tamaño CSS
+        this.canvas.style.width = rect.width + 'px';
+        this.canvas.style.height = rect.height + 'px';
+
+        // Resolución real para retina
+        this.canvas.width = rect.width * this.devicePixelRatio;
+        this.canvas.height = rect.height * this.devicePixelRatio;
+
+        // Escalar contexto
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.ctx.scale(this.devicePixelRatio, this.devicePixelRatio);
+
+        // Blend para glow de partículas
+        this.ctx.globalCompositeOperation = 'lighter';
+
+        // Redimensionar en cambio de ventana
+        window.addEventListener('resize', () => this.setupCanvas());
+    }
+
+    /**
+     * Configurar event listeners para interacción
+     */
+    setupEventListeners() {
+        // Mouse
+        this.canvas.addEventListener('mousemove', (e) => {
+            this.handleMouseMove(e.clientX, e.clientY);
+        });
+
+        this.canvas.addEventListener('mouseenter', () => {
+            this.mouse.active = true;
+        });
+
+        // Click = dispersión global de partículas (sin destello)
+        this.canvas.addEventListener('mousedown', (e) => {
+            this.mouse.pressed = true;
+            this.scatterParticlesAcrossCanvas();
+        });
+
+        this.canvas.addEventListener('mouseup', () => {
+            this.mouse.pressed = false;
+        });
+
+        // Cuando el mouse sale del canvas
+        this.canvas.addEventListener('mouseleave', () => {
+            this.mouse.active = false;
+            this.mouse.pressed = false;
+        });
+
+        // Touch para móviles
+        this.canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            const touch = e.touches[0];
+            this.mouse.active = true;
+            this.mouse.pressed = true;
+            this.touchStartTime = Date.now();
+            this.touchMoved = false;
+            this.handleMouseMove(touch.clientX, touch.clientY);
+        });
+
+        this.canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            if (e.touches.length > 0) {
+                const touch = e.touches[0];
+                this.touchMoved = true;
+                this.handleMouseMove(touch.clientX, touch.clientY);
+            }
+        });
+
+        // Lógica de tap vs hold para dispositivos táctiles
+        this.canvas.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            const touchDuration = Date.now() - this.touchStartTime;
+            
+            this.mouse.active = false;
+            this.mouse.pressed = false;
+            
+            // Si fue un tap rápido (< 300ms) y sin movimiento = explosión
+            if (touchDuration < this.config.touchHoldTime && !this.touchMoved) {
+                this.scatterParticlesAcrossCanvas();
+            }
+            // Si fue hold y movimiento = ya dejó estela, no hacer nada más
+        });
+    }
+
+    /**
+     * Manejar movimiento del cursor/touch
+     */
+    handleMouseMove(x, y) {
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = x - rect.left;
+        this.mouse.y = y - rect.top;
+        this.mouse.active = true;
+        this.lastInteraction = Date.now();
+
+        // Spawn partículas cerca del cursor
+        this.spawnParticlesAtCursor();
+    }
+
+    /**
+     * Dispersar partículas por todo el lienzo (al hacer click)
+     */
+    scatterParticlesAcrossCanvas() {
+        const rectW = this.canvas.width / this.devicePixelRatio;
+        const rectH = this.canvas.height / this.devicePixelRatio;
+
+        const base = this.config.scatterOnClick;
+        const count = Math.min(
+            this.config.maxParticles - this.particles.length,
+            Math.floor(base.min + Math.random() * (base.max - base.min + 1))
+        );
+
+        for (let i = 0; i < count; i++) {
+            const x = Math.random() * rectW;
+            const y = Math.random() * rectH;
+            // Marcamos como "clickSpawn" para intensificar color/ brillo inicial
+            this.particles.push(this.createParticle(x, y, { clickSpawn: true }));
+        }
+
+        this.lastInteraction = Date.now();
+    }
+
+    /**
+     * Crear nueva partícula
+     */
+    createParticle(x, y, opts = {}) {
+        const config = this.config;
+
+        // Velocidad suave/aleatoria
+        const vx = config.particleSpeed.min + Math.random() * (config.particleSpeed.max - config.particleSpeed.min);
+        const vy = config.particleSpeed.min + Math.random() * (config.particleSpeed.max - config.particleSpeed.min);
+        const size = config.particleSize.min + Math.random() * (config.particleSize.max - config.particleSize.min);
+        const life = config.particleLife.min + Math.random() * (config.particleLife.max - config.particleLife.min);
+
+        return {
+            x: x + (Math.random() - 0.5) * (opts.cursor ? config.mouseSpawnRadius : 0),
+            y: y + (Math.random() - 0.5) * (opts.cursor ? config.mouseSpawnRadius : 0),
+            vx, vy, size, life,
+            age: 0,
+            // Movimiento orgánico
+            ax: (Math.random() - 0.5) * 0.002,
+            ay: (Math.random() - 0.5) * 0.002,
+            // Oscilación para movimiento fluido
+            oscillationX: Math.random() * Math.PI * 2,
+            oscillationY: Math.random() * Math.PI * 2,
+            oscillationSpeedX: 0.02 + Math.random() * 0.03,
+            oscillationSpeedY: 0.02 + Math.random() * 0.03,
+            oscillationAmplitudeX: 0.5 + Math.random() * 1.5,
+            oscillationAmplitudeY: 0.5 + Math.random() * 1.5,
+            // Propiedades de nebulosa
+            density: 0.3 + Math.random() * 0.7, // Densidad de la nube
+            turbulence: 0.2 + Math.random() * 0.8, // Turbulencia
+            flow: Math.random() * Math.PI * 2, // Dirección de flujo
+            flowSpeed: 0.01 + Math.random() * 0.02,
+            // Múltiples capas para efecto nebuloso
+            layers: this.isTouchDevice ? 1 + Math.floor(Math.random() * 2) : 3 + Math.floor(Math.random() * 4), // Mucho menos capas en móvil (1-2 vs 3-6)
+            expansion: 0.8 + Math.random() * 0.4,
+            // Pulsación orgánica
+            pulsePhase: Math.random() * Math.PI * 2,
+            pulseSpeed: 0.03 + Math.random() * 0.04,
+            pulseAmplitude: 0.2 + Math.random() * 0.3,
+            // Marca para intensificar color/ brillo (spawns del click)
+            clickSpawn: !!opts.clickSpawn
+        };
+    }
+
+    /**
+     * Renderizar partícula como nebulosa energética
+     */
+    renderParticle(particle) {
+        const agePercent = (particle.age / particle.life) * 100;
+        let alpha = 1;
+
+        // Fade in/out
+        if (agePercent < this.config.fadeInPercent) {
+            alpha = agePercent / this.config.fadeInPercent;
+        } else if (agePercent > (100 - this.config.fadeOutPercent)) {
+            alpha = (100 - agePercent) / this.config.fadeOutPercent;
+        }
+
+        // Pulsación orgánica
+        const pulse = 1 + Math.sin(particle.pulsePhase) * particle.pulseAmplitude;
+        alpha *= pulse;
+
+        // Refuerzo sutil si proviene de un click
+        if (particle.clickSpawn) alpha *= 1.1;
+
+        if (alpha <= 0) return;
+
+        this.ctx.save();
+        this.ctx.translate(particle.x, particle.y);
+
+        // Renderizar nebulosa en múltiples capas
+        this.renderNebula(particle, alpha);
+
+        this.ctx.restore();
+    }
+
+    /**
+     * Renderizar nebulosa con múltiples capas
+     */
+    renderNebula(particle, baseAlpha) {
+        const size = particle.size * particle.expansion;
+        const layers = particle.layers;
+
+        // Asegurar blend "lighter" para partículas
+        const prevOp = this.ctx.globalCompositeOperation;
+        this.ctx.globalCompositeOperation = 'lighter';
+
+        for (let layer = 0; layer < layers; layer++) {
+            const layerProgress = layer / layers;
+            const layerSize = size * (1 - layerProgress * 0.3);
+            const layerAlpha = baseAlpha * (1 - layerProgress * 0.5) * particle.density;
+
+            // Color base de la nebulosa
+            const color = this.getNebularColor(layerAlpha, particle, layerProgress);
+
+            // Gradiente radial
+            const gradient = this.ctx.createRadialGradient(0, 0, 0, 0, 0, layerSize);
+
+            gradient.addColorStop(0, color);
+            const midColor = this.getNebularColor(layerAlpha * 0.7, particle, layerProgress);
+            gradient.addColorStop(0.4, midColor);
+            const edgeColor = this.getNebularColor(layerAlpha * 0.3, particle, layerProgress);
+            gradient.addColorStop(0.8, edgeColor);
+            gradient.addColorStop(1, this.getNebularColor(0, particle, layerProgress));
+
+            // Glow suave para la primera capa (muy reducido en móvil)
+            if (!this.reducedMotion && layer === 0 && (!this.isTouchDevice || Math.random() > 0.8)) {
+                this.ctx.shadowColor = color;
+                this.ctx.shadowBlur = layerSize * (this.isTouchDevice ? 0.2 : 0.8);
+            }
+
+            // Renderizar nube orgánica
+            this.renderOrganicCloud(layerSize, gradient, particle, layer);
+
+            // Quitar sombra para capas adicionales
+            this.ctx.shadowBlur = 0;
+        }
+
+        this.ctx.globalCompositeOperation = prevOp;
+    }
+
+    /**
+     * Renderizar nube orgánica con forma irregular
+     */
+    renderOrganicCloud(size, gradient, particle, layer) {
+        this.ctx.fillStyle = gradient;
+        this.ctx.beginPath();
+
+        // Número de puntos para crear forma orgánica
+        const points = 12 + layer * 2;
+
+        for (let i = 0; i <= points; i++) {
+            const angle = (i / points) * Math.PI * 2;
+
+            // Radio base con variación orgánica
+            let radius = size;
+
+            // Añadir turbulencia basada en el ángulo y tiempo
+            const turbulence1 = Math.sin(angle * 3 + particle.flow) * particle.turbulence * 0.3;
+            const turbulence2 = Math.cos(angle * 5 + particle.flow * 1.3) * particle.turbulence * 0.2;
+            const turbulence3 = Math.sin(angle * 7 + particle.pulsePhase) * 0.1;
+
+            radius *= (0.7 + turbulence1 + turbulence2 + turbulence3);
+
+            // Variación por capa
+            radius *= (1 - layer * 0.05);
+
+            const x = Math.cos(angle) * radius;
+            const y = Math.sin(angle) * radius;
+
+            if (i === 0) {
+                this.ctx.moveTo(x, y);
+            } else {
+                // Usar curvas suaves para forma más orgánica
+                const prevAngle = ((i - 1) / points) * Math.PI * 2;
+                const prevRadius = size * (0.7 +
+                    Math.sin(prevAngle * 3 + particle.flow) * particle.turbulence * 0.3 +
+                    Math.cos(prevAngle * 5 + particle.flow * 1.3) * particle.turbulence * 0.2 +
+                    Math.sin(prevAngle * 7 + particle.pulsePhase) * 0.1
+                ) * (1 - layer * 0.05);
+
+                const prevX = Math.cos(prevAngle) * prevRadius;
+                const prevY = Math.sin(prevAngle) * prevRadius;
+
+                // Puntos de control para curva suave
+                const cpx = (prevX + x) * 0.5 + Math.sin(angle + particle.flow) * size * 0.1;
+                const cpy = (prevY + y) * 0.5 + Math.cos(angle + particle.flow) * size * 0.1;
+
+                this.ctx.quadraticCurveTo(cpx, cpy, x, y);
+            }
+        }
+
+        this.ctx.closePath();
+        this.ctx.fill();
+    }
+
+    /**
+     * Obtener color nebular con variaciones
+     */
+    getNebularColor(alpha, particle, layerProgress) {
+        const colors = this.config.colors;
+
+        // Color base
+        let h = colors.hMin + Math.random() * (colors.hMax - colors.hMin);
+        let s = colors.sMin + Math.random() * (colors.sMax - colors.sMin);
+        let l = colors.lMin + Math.random() * (colors.lMax - colors.lMin);
+
+        // Capas internas más brillantes
+        s += (1 - layerProgress) * 10;
+        l += (1 - layerProgress) * 15;
+
+        // Si la partícula proviene del click, intensificar un poco
+        if (particle && particle.clickSpawn) {
+            s = Math.min(98, s + 8);
+            l = Math.min(92, l + 8);
+            h += Math.sin(particle.flow) * 10;
+        }
+
+        // Mantener valores en rango
+        h = h % 360;
+        s = Math.max(0, Math.min(100, s));
+        l = Math.max(0, Math.min(100, l));
+
+        return `hsla(${h}, ${s}%, ${l}%, ${alpha})`;
+    }
+
+    /**
+     * Spawn partículas en la posición del cursor
+     */
+    spawnParticlesAtCursor() {
+        const count = Math.floor(
+            this.config.mouseSpawnCount.min +
+            Math.random() * (this.config.mouseSpawnCount.max - this.config.mouseSpawnCount.min + 1)
+        );
+
+        for (let i = 0; i < count; i++) {
+            if (this.particles.length < this.config.maxParticles) {
+                this.particles.push(this.createParticle(this.mouse.x, this.mouse.y, { cursor: true }));
+            }
+        }
+    }
+
+    /**
+     * Spawn partículas ambientales
+     */
+    spawnAmbientParticles(deltaTime) {
+        this.ambientTimer += deltaTime;
+
+        // Aumentar spawn durante inactividad
+        const timeSinceInteraction = Date.now() - this.lastInteraction;
+        const inactivityMultiplier = timeSinceInteraction > this.config.inactivityThreshold ? 1.5 : 1;
+
+        const spawnInterval = (1000 / this.config.ambientSpawnRate) / inactivityMultiplier;
+
+        if (this.ambientTimer >= spawnInterval) {
+            this.ambientTimer = 0;
+
+            if (this.particles.length < this.config.maxParticles) {
+                const x = Math.random() * (this.canvas.width / this.devicePixelRatio);
+                const y = Math.random() * (this.canvas.height / this.devicePixelRatio);
+                this.particles.push(this.createParticle(x, y));
+            }
+        }
+    }
+
+    /**
+     * Actualizar partícula con movimiento orgánico
+     */
+    updateParticle(particle, deltaTime) {
+        // Actualizar edad
+        particle.age += deltaTime;
+
+        // Eliminar si ha expirado
+        if (particle.age >= particle.life) return false;
+
+        // Actualizar oscilaciones para movimiento orgánico
+        particle.oscillationX += particle.oscillationSpeedX;
+        particle.oscillationY += particle.oscillationSpeedY;
+        particle.flow += particle.flowSpeed;
+        particle.pulsePhase += particle.pulseSpeed;
+
+        // Movimiento base con deriva
+        particle.vx += particle.ax;
+        particle.vy += particle.ay;
+
+        // Oscilación orgánica
+        const oscillationForceX = Math.sin(particle.oscillationX) * particle.oscillationAmplitudeX * 0.01;
+        const oscillationForceY = Math.cos(particle.oscillationY) * particle.oscillationAmplitudeY * 0.01;
+
+        // Flujo turbulento
+        const turbulentX = Math.sin(particle.flow + particle.x * 0.01) * particle.turbulence * 0.02;
+        const turbulentY = Math.cos(particle.flow + particle.y * 0.01) * particle.turbulence * 0.02;
+
+        // Aplicar fuerzas
+        particle.vx += oscillationForceX + turbulentX;
+        particle.vy += oscillationForceY + turbulentY;
+
+        // Actualizar posición
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+
+        // Resistencia
+        const friction = 0.997;
+        particle.vx *= friction;
+        particle.vy *= friction;
+
+        // Expansión ligera
+        particle.expansion += 0.002;
+
+        return true;
+    }
+
+    /**
+     * Bucle principal de animación
+     */
+    animate() {
+        const now = Date.now();
+        const deltaTime = now - (this.lastFrameTime || now);
+        this.lastFrameTime = now;
+
+        // Limpiar canvas
+        this.ctx.clearRect(0, 0, this.canvas.width / this.devicePixelRatio, this.canvas.height / this.devicePixelRatio);
+
+        // Spawn partículas ambientales
+        this.spawnAmbientParticles(deltaTime);
+
+        // Actualizar y renderizar partículas
+        this.particles = this.particles.filter(particle => {
+            const alive = this.updateParticle(particle, deltaTime);
+            if (alive) this.renderParticle(particle);
+            return alive;
+        });
+
+        // Limitar número máximo de partículas (eliminar las más antiguas)
+        if (this.particles.length > this.config.maxParticles) {
+            this.particles.splice(0, this.particles.length - this.config.maxParticles);
+        }
+
+        // Continuar animación (ajustar FPS según dispositivo)
+        let targetFPS = 60;
+        if (this.reducedMotion) {
+            targetFPS = 30;
+        } else if (this.isTouchDevice) {
+            targetFPS = 40; // FPS más reducido para mejor fluidez en móvil
+        }
+
+        if (targetFPS < 60) {
+            setTimeout(() => requestAnimationFrame(() => this.animate()), 1000 / targetFPS);
+        } else {
+            requestAnimationFrame(() => this.animate());
+        }
+    }
+}
+
+/**
+ * Inicializar sistema cuando el DOM esté listo
+ */
+document.addEventListener('DOMContentLoaded', () => {
+    const canvas = document.getElementById('canvas');
+    new EtherealParticleSystem(canvas);
+});
+
+/**
+ * Prevenir comportamientos por defecto en móviles
+ */
+document.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+}, { passive: false });
+
+document.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+}, { passive: false });
+</script>
+</body>
+</html>
